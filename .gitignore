@@ -1,0 +1,15 @@
+# Python environment & cache
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Environment secrets & vector databases
+.env
+storage/
+
+# Editor settings
+.vscode/
+
+# Data
+data/
