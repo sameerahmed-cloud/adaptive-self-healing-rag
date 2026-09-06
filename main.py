@@ -7,6 +7,7 @@ import shutil
 import qdrant_client
 import logging
 import warnings
+import uuid
 
 from pathlib import Path
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ from llama_index.core.tools import (
     QueryEngineTool,
     ToolMetadata,
 )
+
+from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
 
 from llama_index.llms.google_genai import GoogleGenAI
 
@@ -306,18 +309,41 @@ def save_manifest(
         exist_ok=True,
     )
 
-    with open(
-        MANIFEST_FILE,
-        "w",
-        encoding="utf-8",
-    ) as file:
+    temp_file = MANIFEST_FILE.with_suffix(
+        ".tmp"
+    )
 
-        json.dump(
-            manifest,
-            file,
-            indent=2,
-            ensure_ascii=False,
+    try:
+        
+        with open(
+            MANIFEST_FILE,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                manifest,
+                file,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+            file.flush()
+            os.fsync(
+                file.fileno()
+            )
+
+        os.replace(
+            temp_file,
+            MANIFEST_FILE,
         )
+
+    except Exception:
+
+        if temp_file.exists():
+            temp_file.unlink()
+
+        raise
 
 
 # FILE CLASSIFICATION
@@ -357,19 +383,13 @@ def classify_file(
 # TEXT ANALYSIS
 
 def run_local_metrics(text: str) -> Tuple[int, int]:
-    """
-    Handles math tasks locally using quick, precise calculations.
-    """
+    
     words = re.findall(r"\b\w+\b", text)
     lines = text.splitlines()
     return len(words), len(lines)
 
 
 def run_heuristic_filter(text: str) -> dict:
-    """
-    Quickly check if a document even has the 
-    raw ingredients for code, tables, or headers before paying for an LLM.
-    """
 
     has_code_signals = bool(re.search(
         r"\b(def|class|import|function|SELECT|FROM)\b|=>|if\s*\(", 
@@ -395,10 +415,7 @@ def run_heuristic_filter(text: str) -> dict:
 
 
 def evaluate_content_structure_llm(text: str, filters: dict) -> dict:
-    """
-    Leverages LLM to extract spatial and structural context.
-    Only asks about attributes that passed the heuristic screening.
-    """
+   
     structure = {
         "has_headers": False,
         "has_tables": False,
@@ -451,10 +468,7 @@ def profile_document(
     path: Path,
     extracted_text: Optional[str] = None,
 ) -> DocumentProfile:
-    """
-    Assembles comprehensive diagnostic file profiling models by blending
-    system metadata, heuristic text screening, and targeted contextual LLM insight.
-    """
+    
     extension = path.suffix.lower()
     document_type = classify_file(path)
 
@@ -1312,6 +1326,19 @@ class AdaptiveRAG:
 
         return True
 
+    def persist_indexes(self):
+
+        if self.vector_index is None:
+            return
+
+        print("--> [PERSIST] Saving index state...")
+
+        self.vector_index.storage_context.persist(
+            persist_dir=str(STORAGE_DIR)
+        )
+
+        print("--> [PERSIST] Index state saved.")
+
     def create_indexes(
         self,
         nodes,
@@ -1352,26 +1379,12 @@ class AdaptiveRAG:
             self.SUMMARY_INDEX_ID
         )
 
-        storage_context.persist(
-            persist_dir=str(
-                STORAGE_DIR
-            )
-        )
-
+        self.persist_indexes()
 
     def delete_document_from_indexes(
         self,
         document_id: str,
     ):
-        """
-        Delete ALL chunks belonging to one document.
-
-        This is the important fix for deleted files.
-
-        Because every chunk inherited the same ref_doc_id,
-        delete_ref_doc() removes the document's nodes rather
-        than requiring us to know every individual chunk ID.
-        """
 
         print(
             f"--> [DELETE INDEX] "
@@ -1379,26 +1392,29 @@ class AdaptiveRAG:
             f"{document_id[:12]}..."
         )
 
-        if self.vector_index:
+        if self.vector_index is None:
+            raise RuntimeError(
+            "Vector index is not loaded."
+        )
 
-            try:
+        try:
 
-                self.vector_index.delete_ref_doc(
-                    ref_doc_id=document_id,
-                    delete_from_docstore=True,
-                )
+            self.vector_index.delete_ref_doc(
+                ref_doc_id=document_id,
+                delete_from_docstore=True,
+            )
 
-                print(
-                    "--> [DELETE INDEX] "
-                    "Vector index cleaned."
-                )
+            print(
+                "--> [DELETE INDEX] "
+                "Vector index cleaned."
+            )
 
-            except Exception as error:
+        except Exception as error:
+            raise RuntimeError(
+                f"Vector index deletion failed for "
+                f"{document_id}: {error}"
+            ) from error
 
-                print(
-                    f"--> [WARNING] "
-                    f"Vector deletion failed: {error}"
-                )
 
         if self.summary_index:
 
@@ -1415,11 +1431,12 @@ class AdaptiveRAG:
                 )
 
             except Exception as error:
-
-                print(
-                    f"--> [WARNING] "
-                    f"Summary deletion failed: {error}"
-                )
+                raise RuntimeError(
+                    f"Summary index deletion failed for "
+                    f"{document_id}: {error}"
+                ) from error
+            
+        self.persist_indexes()
 
 
     def ingest_file(
@@ -1453,6 +1470,10 @@ class AdaptiveRAG:
         nodes = self.chunker.process(
             documents
         )
+
+        for node in nodes:
+            node.id_ = str(uuid.uuid4())
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=document_id)
 
         print(
             f"--> [INGEST] "
@@ -1759,15 +1780,25 @@ class AdaptiveRAG:
             f"Inserting {len(nodes)} nodes..."
         )
 
-        self.vector_index.insert_nodes(
-            nodes
-        )
+        try:
 
-        if self.summary_index:
-
-            self.summary_index.insert_nodes(
+            self.vector_index.insert_nodes(
                 nodes
             )
+
+            if self.summary_index is not None:
+                self.summary_index.insert_nodes(
+                    nodes
+                )
+
+            self.persist_indexes()
+
+        except Exception as error:
+
+            raise RuntimeError(
+                f"Failed to insert nodes into indexes: "
+                f"{error}"
+            ) from error
 
     def build_router(self):
 
@@ -1832,10 +1863,7 @@ class AdaptiveRAG:
         return self.engine
 
     def evaluate_faithfulness(self, answer: str, contexts: list) -> bool:
-        """
-        Production Faithfulness Auditor: Compares the generated answer 
-        strictly against the source text blocks to eliminate assumptions.
-        """
+        
         if not contexts:
             return False
         
@@ -1924,8 +1952,18 @@ class AdaptiveRAG:
 
         print(
             "--> [WIPE] "
-            "Deleting RAG storage..."
+            "Deleting RAG storage and container volumes..."
         )
+
+        try:
+            collection_name = "pipeline_collection"
+            collections = self.db_client.get_collections().collections
+            if any(c.name == collection_name for c in collections):
+                self.db_client.delete_collection(collection_name=collection_name)
+                print("--> [WIPE] Qdrant collection dropped from Docker bubble.")
+        except Exception as e:
+            print(f"--> [WARNING] Failed to drop Qdrant collection: {e}")
+
 
         if STORAGE_DIR.exists():
 

@@ -13,3 +13,6 @@ storage/
 
 # Data
 data/
+
+README.md
+.env.example
