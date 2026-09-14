@@ -8,6 +8,9 @@ import qdrant_client
 import logging
 import warnings
 import uuid
+import time
+import math
+from collections import Counter, defaultdict
 
 from pathlib import Path
 from dataclasses import dataclass
@@ -23,6 +26,10 @@ from llama_index.core import (
     SummaryIndex,
     StorageContext,
     load_index_from_storage,
+)
+
+from llama_index.core.callbacks import (
+    CallbackManager, TokenCountingHandler,
 )
 
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -46,7 +53,8 @@ from llama_index.core.tools import (
     ToolMetadata,
 )
 
-from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
+from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, NodeWithScore
+from llama_index.core.postprocessor import PrevNextNodePostprocessor
 
 from llama_index.llms.google_genai import GoogleGenAI
 
@@ -62,6 +70,157 @@ logging.getLogger("llama_index").setLevel(logging.WARNING)
 
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+class APIUsageTracker:
+    """Lightweight, real-time observability for the current application session."""
+
+    def __init__(self):
+        self.started_at = time.perf_counter()
+        self.llm_token_counter = TokenCountingHandler()
+        self.callback_manager = CallbackManager([self.llm_token_counter])
+
+        # External API / model activity
+        self.llm_calls = 0
+        self.llm_operations = {}
+        self.llama_parse_calls = 0
+        self.llama_parse_duration = 0.0
+
+        # Local pipeline activity
+        self.embedding_calls = 0
+        self.embedding_tokens = 0
+        self.embedding_duration = 0.0
+        self.nodes_indexed = 0
+        self.indexing_duration = 0.0
+        self.chunking_duration = 0.0
+
+        # Query/retrieval activity
+        self.query_count = 0
+        self.retrieval_nodes = 0
+        self.query_duration = 0.0
+
+    def attach(self):
+        Settings.callback_manager = self.callback_manager
+
+    def llm_snapshot(self):
+        return (
+            len(self.llm_token_counter.llm_token_counts),
+            self.llm_token_counter.total_llm_token_count,
+            self.llm_token_counter.prompt_llm_token_count,
+            self.llm_token_counter.completion_llm_token_count,
+        )
+
+    def embedding_snapshot(self):
+        handler = self.llm_token_counter
+        return (
+            len(getattr(handler, "embedding_token_counts", [])),
+            getattr(handler, "total_embedding_token_count", 0),
+        )
+
+    def record_llm_operation(self, name, before_snapshot):
+        after = self.llm_snapshot()
+        calls = max(0, after[0] - before_snapshot[0])
+        total = max(0, after[1] - before_snapshot[1])
+        input_tokens = max(0, after[2] - before_snapshot[2])
+        output_tokens = max(0, after[3] - before_snapshot[3])
+
+        operation = self.llm_operations.setdefault(
+            name,
+            {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        operation["calls"] += calls
+        operation["input_tokens"] += input_tokens
+        operation["output_tokens"] += output_tokens
+        operation["total_tokens"] += total
+        self.llm_calls += calls
+
+    def record_llama_parse(self, duration):
+        self.llama_parse_calls += 1
+        self.llama_parse_duration += duration
+
+    def record_embedding_delta(self, before_snapshot, duration=0.0):
+        after = self.embedding_snapshot()
+        calls = max(0, after[0] - before_snapshot[0])
+        tokens = max(0, after[1] - before_snapshot[1])
+        self.embedding_calls += calls
+        self.embedding_tokens += tokens
+        self.embedding_duration += duration
+
+    def record_indexing(self, duration, nodes):
+        self.indexing_duration += duration
+        self.nodes_indexed += nodes
+
+    def record_chunking(self, duration):
+        self.chunking_duration += duration
+
+    def record_query(self, query_count, duration, retrieved_nodes):
+        self.query_count += 1
+        self.query_duration += duration
+        self.retrieval_nodes += retrieved_nodes
+
+    def query_usage_delta(self, before_snapshot):
+        after = self.llm_snapshot()
+        return (
+            max(0, after[0] - before_snapshot[0]),
+            max(0, after[2] - before_snapshot[2]),
+            max(0, after[3] - before_snapshot[3]),
+            max(0, after[1] - before_snapshot[1]),
+        )
+
+    def print_query_usage(self, before_snapshot):
+        calls, input_tokens, output_tokens, total = self.query_usage_delta(before_snapshot)
+        print("\n[QUERY OBSERVABILITY]")
+        print(f"  Gemini API calls:   {calls}")
+        print(f"  Input tokens:       {input_tokens:,}  (prompt + instructions + RAG context)")
+        print(f"  Output tokens:      {output_tokens:,}  (Gemini-generated text)")
+        print(f"  Total tokens:       {total:,}")
+
+    def print_summary(self):
+        input_tokens = self.llm_token_counter.prompt_llm_token_count
+        output_tokens = self.llm_token_counter.completion_llm_token_count
+        total_tokens = self.llm_token_counter.total_llm_token_count
+        session_seconds = time.perf_counter() - self.started_at
+
+        print("\n" + "=" * 70)
+        print("                    PHASE 2 OBSERVABILITY")
+        print("=" * 70)
+        print(f"SESSION TIME:         {session_seconds:.2f}s")
+        print("\nGEMINI")
+        #print(f"  Model:              {GEMINI_MODEL}")
+        print(f"  API calls:          {self.llm_calls}")
+        print(f"  Input tokens:       {input_tokens:,}  (prompts + instructions + RAG context)")
+        print(f"  Output tokens:      {output_tokens:,}  (Gemini-generated text)")
+        print(f"  Total tokens:       {total_tokens:,}")
+        print("  By operation:")
+        for name, usage in self.llm_operations.items():
+            print(
+                f"    {name}: {usage['calls']} calls | "
+                f"input {usage['input_tokens']:,} | "
+                f"output {usage['output_tokens']:,} | "
+                f"total {usage['total_tokens']:,}"
+            )
+
+        print("\nLLAMAPARSE")
+        print(f"  API calls:          {self.llama_parse_calls}")
+        print(f"  Parse time:         {self.llama_parse_duration:.2f}s")
+
+        print("\nLOCAL PIPELINE")
+        print(f"  Embedding calls:    {self.embedding_calls}")
+        print(f"  Embedding tokens:   {self.embedding_tokens:,}")
+        print(f"  Embedding time:     {self.embedding_duration:.2f}s")
+        print(f"  Nodes indexed:      {self.nodes_indexed:,}")
+        print(f"  Indexing time:      {self.indexing_duration:.2f}s")
+        print(f"  Chunking time:      {self.chunking_duration:.2f}s")
+
+        print("\nRETRIEVAL")
+        print(f"  Queries:            {self.query_count}")
+        print(f"  Retrieved nodes:    {self.retrieval_nodes:,}")
+        print(f"  Query time:         {self.query_duration:.2f}s")
+        print("=" * 70)
+
+
+API_TRACKER = APIUsageTracker()
+API_TRACKER.attach()
+
 
 # ENVIRONMENT
 load_dotenv()
@@ -316,7 +475,7 @@ def save_manifest(
     try:
         
         with open(
-            MANIFEST_FILE,
+            temp_file,
             "w",
             encoding="utf-8",
         ) as file:
@@ -452,7 +611,12 @@ def evaluate_content_structure_llm(text: str, filters: dict) -> dict:
     """
 
     try:
+        llm_before = API_TRACKER.llm_snapshot()
         response = Settings.llm.complete(prompt)
+        API_TRACKER.record_llm_operation(
+            "document_profiling",
+            llm_before,
+        )
         clean_response = repair_json(response.text.strip())
         
         
@@ -553,8 +717,12 @@ def load_single_file(
 
         parser = create_llama_parser()
 
+        parse_start = time.perf_counter()
         parsed_documents = parser.load_data(
             str(path)
+        )
+        API_TRACKER.record_llama_parse(
+            time.perf_counter() - parse_start
         )
 
         for document in parsed_documents:
@@ -1247,6 +1415,154 @@ def discover_files(
     return sorted(files)
 
 
+
+@dataclass
+class QueryProfile:
+    """Lightweight query analysis used to select an adaptive retrieval path."""
+
+    mode: str
+    reason: str
+    needs_exact_match: bool = False
+    is_broad: bool = False
+    is_complex: bool = False
+
+
+class LexicalIndex:
+    """
+    Small dependency-free BM25-style lexical index.
+
+    It indexes node text plus useful metadata so exact identifiers, filenames,
+    fields, error codes, SKUs, and similar lexical signals can be retrieved
+    even when dense similarity is not the strongest signal.
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.nodes = []
+        self.term_frequencies = []
+        self.document_frequencies = Counter()
+        self.document_lengths = []
+        self.average_document_length = 0.0
+        self.built = False
+
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        return re.findall(r"[A-Za-z0-9_]+", text.lower())
+
+    @staticmethod
+    def searchable_text(node) -> str:
+        metadata = getattr(node, "metadata", {}) or {}
+        metadata_parts = [
+            str(metadata.get(key, ""))
+            for key in (
+                "file_name",
+                "file_path",
+                "sheet_name",
+                "language",
+                "document_type",
+                "chunk_strategy",
+            )
+        ]
+        return " ".join(
+            [node.get_content()] + metadata_parts
+        )
+
+    def build(self, nodes: List) -> None:
+        self.nodes = list(nodes)
+        self.term_frequencies = []
+        self.document_frequencies = Counter()
+        self.document_lengths = []
+
+        for node in self.nodes:
+            terms = self.tokenize(self.searchable_text(node))
+            frequencies = Counter(terms)
+            self.term_frequencies.append(frequencies)
+            self.document_lengths.append(len(terms))
+            self.document_frequencies.update(frequencies.keys())
+
+        total_length = sum(self.document_lengths)
+        self.average_document_length = (
+            total_length / len(self.nodes)
+            if self.nodes
+            else 0.0
+        )
+        self.built = True
+
+    def retrieve(self, query: str, top_k: int = 8) -> List[NodeWithScore]:
+        if not self.built or not self.nodes:
+            return []
+
+        query_terms = self.tokenize(query)
+        if not query_terms:
+            return []
+
+        query_counter = Counter(query_terms)
+        total_documents = len(self.nodes)
+        average_length = self.average_document_length or 1.0
+
+        scored = []
+        for index, node in enumerate(self.nodes):
+            frequencies = self.term_frequencies[index]
+            document_length = self.document_lengths[index] or 1
+            score = 0.0
+
+            for term in query_counter:
+                frequency = frequencies.get(term, 0)
+                if frequency == 0:
+                    continue
+
+                document_frequency = self.document_frequencies.get(term, 0)
+                idf = math.log(
+                    1.0
+                    + (
+                        (total_documents - document_frequency + 0.5)
+                        / (document_frequency + 0.5)
+                    )
+                )
+
+                denominator = (
+                    frequency
+                    + self.k1
+                    * (
+                        1.0
+                        - self.b
+                        + self.b
+                        * document_length
+                        / average_length
+                    )
+                )
+                score += (
+                    idf
+                    * (
+                        frequency
+                        * (self.k1 + 1.0)
+                        / denominator
+                    )
+                )
+
+            if score <= 0:
+                continue
+
+            searchable = self.searchable_text(node).lower()
+            query_text = query.lower().strip()
+            if query_text and query_text in searchable:
+                score += 1.0
+
+            scored.append(
+                NodeWithScore(
+                    node=node,
+                    score=float(score),
+                )
+            )
+
+        scored.sort(
+            key=lambda item: item.score or 0.0,
+            reverse=True,
+        )
+        return scored[:top_k]
+
+
 class AdaptiveRAG:
 
     VECTOR_INDEX_ID = "vector_idx"
@@ -1277,6 +1593,12 @@ class AdaptiveRAG:
         self.summary_index = None
 
         self.db_client = qdrant_client.QdrantClient(url="http://localhost:6333")
+
+        # Phase 5: adaptive retrieval configuration.
+        self.lexical_index = LexicalIndex()
+        self.retrieval_top_k = 5
+        self.candidate_top_k = 12
+        self.default_rag_mode = "auto"
 
     def indexes_exist(self) -> bool:
 
@@ -1324,16 +1646,22 @@ class AdaptiveRAG:
             )
         )
 
+        self.rebuild_lexical_index()
+
         return True
 
     def persist_indexes(self):
 
-        if self.vector_index is None:
+        if self.vector_index is None and self.summary_index is None:
             return
 
         print("--> [PERSIST] Saving index state...")
 
         self.vector_index.storage_context.persist(
+            persist_dir=str(STORAGE_DIR)
+        )
+
+        self.summary_index.storage_context.persist(
             persist_dir=str(STORAGE_DIR)
         )
 
@@ -1347,6 +1675,9 @@ class AdaptiveRAG:
         print(
             "--> [INDEX] Creating production VectorDB collection..."
         )
+
+        index_start = time.perf_counter()
+        embedding_before = API_TRACKER.embedding_snapshot()
 
         vector_store = QdrantVectorStore(
             client=self.db_client,
@@ -1380,6 +1711,13 @@ class AdaptiveRAG:
         )
 
         self.persist_indexes()
+
+        API_TRACKER.record_indexing(
+            time.perf_counter() - index_start,
+            len(nodes),
+        )
+        API_TRACKER.record_embedding_delta(embedding_before)
+        self.rebuild_lexical_index()
 
     def delete_document_from_indexes(
         self,
@@ -1437,6 +1775,7 @@ class AdaptiveRAG:
                 ) from error
             
         self.persist_indexes()
+        self.rebuild_lexical_index()
 
 
     def ingest_file(
@@ -1467,6 +1806,7 @@ class AdaptiveRAG:
 
             return []
 
+        chunk_start = time.perf_counter()
         nodes = self.chunker.process(
             documents
         )
@@ -1474,6 +1814,9 @@ class AdaptiveRAG:
         for node in nodes:
             node.id_ = str(uuid.uuid4())
             node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=document_id)
+
+        chunk_seconds = time.perf_counter() - chunk_start
+        API_TRACKER.record_chunking(chunk_seconds)
 
         print(
             f"--> [INGEST] "
@@ -1782,6 +2125,9 @@ class AdaptiveRAG:
 
         try:
 
+            index_start = time.perf_counter()
+            embedding_before = API_TRACKER.embedding_snapshot()
+
             self.vector_index.insert_nodes(
                 nodes
             )
@@ -1792,6 +2138,12 @@ class AdaptiveRAG:
                 )
 
             self.persist_indexes()
+            API_TRACKER.record_indexing(
+            time.perf_counter() - index_start,
+            len(nodes),
+            )
+            API_TRACKER.record_embedding_delta(embedding_before)
+            self.rebuild_lexical_index()
 
         except Exception as error:
 
@@ -1800,65 +2152,392 @@ class AdaptiveRAG:
                 f"{error}"
             ) from error
 
-    def build_router(self):
+    def rebuild_lexical_index(self):
+        """Rebuild the local lexical index from the persisted node docstore."""
+        if self.vector_index is None:
+            self.lexical_index = LexicalIndex()
+            return
 
-        if not self.vector_index:
+        nodes = list(self.vector_index.docstore.docs.values())
+        self.lexical_index.build(nodes)
 
-            self.load_indexes()
+        print(
+            f"--> [RETRIEVAL] Lexical index rebuilt: "
+            f"{len(nodes)} nodes"
+        )
 
-        vector_engine = (
-            self.vector_index.as_query_engine(
-                similarity_top_k=5,
-                response_mode="compact",
+    def profile_query(
+        self,
+        question: str,
+        rag_mode: str = "auto",
+    ) -> QueryProfile:
+        """
+        Select a retrieval strategy.
+
+        User-selected modes are honored explicitly. In auto mode the system
+        uses lightweight lexical signals to choose between semantic, keyword,
+        hybrid, and summary retrieval.
+        """
+        requested_mode = (rag_mode or self.default_rag_mode).strip().lower()
+
+        aliases = {
+            "vector": "semantic",
+            "dense": "semantic",
+            "bm25": "keyword",
+            "lexical": "keyword",
+            "hybrid_search": "hybrid",
+            "global": "summary",
+        }
+        requested_mode = aliases.get(
+            requested_mode,
+            requested_mode,
+        )
+
+        valid_modes = {
+            "auto",
+            "semantic",
+            "keyword",
+            "hybrid",
+            "summary",
+        }
+        if requested_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported RAG mode '{rag_mode}'. "
+                f"Choose from: {', '.join(sorted(valid_modes))}."
             )
+
+        if requested_mode != "auto":
+            return QueryProfile(
+                mode=requested_mode,
+                reason="user selected",
+            )
+
+        normalized = question.lower().strip()
+
+        exact_patterns = [
+            r"`[^`]+`",
+            r"\b(error|exception|traceback|id|code|filename|"
+            r"function|method|variable|class|field|column|sku|part)\b",
+            r"\b[a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]+\b",
+            r"\b[a-zA-Z0-9]+-[a-zA-Z0-9-]+\b",
+        ]
+        needs_exact_match = any(
+            re.search(pattern, question, flags=re.IGNORECASE)
+            for pattern in exact_patterns
+        ) or len(re.findall(r"\b\d+\b", question)) >= 2
+
+        broad_terms = {
+            "summarize",
+            "summary",
+            "overview",
+            "overall",
+            "main themes",
+            "key themes",
+            "entire document",
+            "whole document",
+            "all documents",
+            "big picture",
+        }
+        is_broad = any(term in normalized for term in broad_terms)
+
+        complex_terms = {
+            "compare",
+            "comparison",
+            "contrast",
+            "difference",
+            "differences",
+            "versus",
+            "vs",
+            "across",
+            "multiple",
+            "both",
+            "and explain",
+            "why and how",
+        }
+        is_complex = any(
+            term in normalized
+            for term in complex_terms
+        ) or question.count("?") > 1
+
+        if is_broad:
+            return QueryProfile(
+                mode="summary",
+                reason="broad/global question",
+                needs_exact_match=needs_exact_match,
+                is_broad=True,
+                is_complex=is_complex,
+            )
+
+        if needs_exact_match and is_complex:
+            return QueryProfile(
+                mode="hybrid",
+                reason="exact-match signals + complex comparison",
+                needs_exact_match=True,
+                is_complex=True,
+            )
+
+        if needs_exact_match:
+            return QueryProfile(
+                mode="keyword",
+                reason="exact identifier/fact signals",
+                needs_exact_match=True,
+            )
+
+        if is_complex:
+            return QueryProfile(
+                mode="hybrid",
+                reason="multi-part/comparison question",
+                is_complex=True,
+            )
+
+        return QueryProfile(
+            mode="semantic",
+            reason="conceptual/semantic question",
         )
 
-        vector_tool = QueryEngineTool(
-            query_engine=vector_engine,
-            metadata=ToolMetadata(
-                name="vector_query_tool",
-                description=(
-                    "Use this for specific facts, "
-                    "numbers, IDs, error codes, "
-                    "functions, variables, code, "
-                    "specific passages, filenames, "
-                    "and precise document questions."
-                ),
-            ),
+    def _vector_retrieve(
+        self,
+        question: str,
+        top_k: int,
+    ) -> List[NodeWithScore]:
+        retriever = self.vector_index.as_retriever(
+            similarity_top_k=top_k
+        )
+        return retriever.retrieve(question)
+
+    def _rerank(
+        self,
+        question: str,
+        candidates: List[NodeWithScore],
+        top_k: int,
+    ) -> List[NodeWithScore]:
+        """
+        Lightweight local reranker.
+
+        It preserves the retriever score while rewarding query-term coverage
+        and exact phrase matches. This keeps Phase 5 dependency-free; a
+        cross-encoder can be evaluated later if testing shows it is needed.
+        """
+        query_terms = set(
+            LexicalIndex.tokenize(question)
+        )
+        query_phrase = question.lower().strip()
+
+        if not candidates:
+            return []
+
+        source_scores = [
+            float(candidate.score or 0.0)
+            for candidate in candidates
+        ]
+        max_score = max(source_scores) or 1.0
+
+        reranked = []
+        for candidate in candidates:
+            content = candidate.node.get_content().lower()
+            candidate_terms = set(
+                LexicalIndex.tokenize(content)
+            )
+
+            coverage = (
+                len(query_terms & candidate_terms)
+                / len(query_terms)
+                if query_terms
+                else 0.0
+            )
+            exact_phrase = (
+                1.0
+                if query_phrase and query_phrase in content
+                else 0.0
+            )
+            normalized_source = (
+                float(candidate.score or 0.0) / max_score
+            )
+
+            final_score = (
+                0.55 * normalized_source
+                + 0.35 * coverage
+                + 0.10 * exact_phrase
+            )
+
+            reranked.append(
+                NodeWithScore(
+                    node=candidate.node,
+                    score=final_score,
+                )
+            )
+
+        reranked.sort(
+            key=lambda item: item.score or 0.0,
+            reverse=True,
+        )
+        return reranked[:top_k]
+
+    def _merge_hybrid(
+        self,
+        vector_results: List[NodeWithScore],
+        keyword_results: List[NodeWithScore],
+        top_k: int,
+    ) -> List[NodeWithScore]:
+        """Fuse dense and lexical candidates using reciprocal rank fusion."""
+        fused_scores = defaultdict(float)
+        nodes_by_id = {}
+
+        for results in (vector_results, keyword_results):
+            for rank, result in enumerate(results, start=1):
+                node_id = result.node.node_id
+                nodes_by_id[node_id] = result.node
+                fused_scores[node_id] += 1.0 / (60.0 + rank)
+
+        fused = [
+            NodeWithScore(
+                node=nodes_by_id[node_id],
+                score=score,
+            )
+            for node_id, score in fused_scores.items()
+        ]
+        fused.sort(
+            key=lambda item: item.score or 0.0,
+            reverse=True,
+        )
+        return fused[:top_k]
+
+    def retrieve_adaptively(
+        self,
+        question: str,
+        profile: QueryProfile,
+    ):
+        """Run only the retrieval path selected for the current query."""
+        if profile.mode == "summary":
+            return None, "summary"
+
+        if profile.mode == "semantic":
+            candidates = self._vector_retrieve(
+                question,
+                self.candidate_top_k,
+            )
+
+        elif profile.mode == "keyword":
+            candidates = self.lexical_index.retrieve(
+                question,
+                self.candidate_top_k,
+            )
+
+        elif profile.mode == "hybrid":
+            vector_results = self._vector_retrieve(
+                question,
+                self.candidate_top_k,
+            )
+            keyword_results = self.lexical_index.retrieve(
+                question,
+                self.candidate_top_k,
+            )
+            candidates = self._merge_hybrid(
+                vector_results,
+                keyword_results,
+                self.candidate_top_k,
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported retrieval mode: {profile.mode}"
+            )
+
+        reranked = self._rerank(
+            question,
+            candidates,
+            self.retrieval_top_k,
         )
 
-        summary_engine = (
-            self.summary_index.as_query_engine(
+        # Expand each winning chunk by its immediate neighboring chunks when
+        # the parser supplied PREVIOUS/NEXT relationships.
+        postprocessor = PrevNextNodePostprocessor(
+            docstore=self.vector_index.docstore,
+            num_nodes=1,
+            mode="both",
+        )
+        expanded = postprocessor.postprocess_nodes(reranked)
+
+        # Deduplicate while preserving reranked/expanded order.
+        unique_nodes = []
+        seen_ids = set()
+        for node_with_score in expanded:
+            node_id = node_with_score.node.node_id
+            if node_id in seen_ids:
+                continue
+            seen_ids.add(node_id)
+            unique_nodes.append(node_with_score)
+
+        return unique_nodes, profile.mode
+
+    def synthesize_answer(
+        self,
+        question: str,
+        retrieved_nodes: List[NodeWithScore],
+    ) -> str:
+        """Generate an answer strictly from the selected retrieval context."""
+        if not retrieved_nodes:
+            return (
+                "The provided documentation does not contain "
+                "enough information to answer this question."
+            )
+
+        contexts = []
+        for index, item in enumerate(retrieved_nodes, start=1):
+            node = item.node
+            metadata = getattr(node, "metadata", {}) or {}
+            source = (
+                metadata.get("file_name")
+                or metadata.get("file_path")
+                or "unknown source"
+            )
+            contexts.append(
+                f"[Context {index} | Source: {source}]\n"
+                f"{node.get_content()}"
+            )
+
+        unified_context = "\n\n---\n\n".join(contexts)
+
+        prompt = f"""
+            You are a retrieval-augmented assistant.
+
+            Answer the user's question using ONLY the supplied CONTEXT.
+            Do not use outside knowledge.
+            Do not invent facts, values, identifiers, filenames, or relationships.
+            If the context does not contain enough information, say:
+            "The provided documentation does not contain this information."
+
+            QUESTION:
+            {question}
+
+            CONTEXT:
+            \"\"\"{unified_context}\"\"\"
+
+            Provide a concise, factual answer.
+            """
+
+        return Settings.llm.complete(prompt).text.strip()
+
+    def build_router(self):
+        """
+        Prepare retrieval state.
+
+        Phase 5 no longer asks an LLM to choose only between vector and
+        summary engines. Query profiling now selects semantic, keyword,
+        hybrid, or summary retrieval explicitly or automatically.
+        """
+        if self.vector_index is None:
+            if not self.load_indexes():
+                return None
+
+        self.rebuild_lexical_index()
+
+        if self.summary_index is not None:
+            self.engine = self.summary_index.as_query_engine(
                 response_mode="tree_summarize",
             )
-        )
-
-        summary_tool = QueryEngineTool(
-            query_engine=summary_engine,
-            metadata=ToolMetadata(
-                name="summary_query_tool",
-                description=(
-                    "Use this for broad questions, "
-                    "overall summaries, themes, "
-                    "comparisons, and questions "
-                    "requiring information from "
-                    "many parts of the document collection."
-                ),
-            ),
-        )
-
-        self.engine = (
-            RouterQueryEngine(
-                selector=(
-                    LLMSingleSelector.from_defaults()
-                ),
-                query_engine_tools=[
-                    vector_tool,
-                    summary_tool,
-                ],
-                verbose=True,
-            )
-        )
+        else:
+            self.engine = None
 
         return self.engine
 
@@ -1887,66 +2566,187 @@ class AdaptiveRAG:
         Do not include any introductory remarks, punctuation, explanations, or markdown boxes. One word only.
         """
         try:
+            llm_before = API_TRACKER.llm_snapshot()
             result = Settings.llm.complete(eval_prompt).text.strip().upper()
+            API_TRACKER.record_llm_operation(
+                "faithfulness_evaluation",
+                llm_before,
+            )
             return "SAFE" in result
         except Exception:
             return True 
 
-    def ask(self, question: str, max_retries: int = 3) -> str:
-        if self.engine is None:
-            self.build_router()
+    def ask(
+        self,
+        question: str,
+        rag_mode: str = "auto",
+        max_retries: int = 3,
+    ) -> str:
+        if self.vector_index is None:
+            if not self.load_indexes():
+                return (
+                    "The knowledge base is not initialized. "
+                    "Add documents and synchronize first."
+                )
+
+        if not self.lexical_index.built:
+            self.rebuild_lexical_index()
 
         print(f"\n[QUESTION]\n{question}")
+        query_start = time.perf_counter()
 
-        response = self.engine.query(question)
-        generated_answer = response.response
+        profile = self.profile_query(
+            question,
+            rag_mode=rag_mode,
+        )
 
-        retrieved_contexts = [node.node.get_content() for node in response.source_nodes]
-        unified_context = "\n---\n".join(retrieved_contexts)
+        print(
+            f"[RETRIEVAL STRATEGY] "
+            f"{profile.mode} "
+            f"({profile.reason})"
+        )
+
+        llm_before = API_TRACKER.llm_snapshot()
+
+        if profile.mode == "summary":
+            if self.engine is None:
+                self.build_router()
+
+            if self.engine is None:
+                generated_answer = (
+                    "The summary retrieval engine is unavailable."
+                )
+                retrieved_contexts = []
+            else:
+                response = self.engine.query(question)
+                generated_answer = response.response
+                retrieved_contexts = [
+                    node.node.get_content()
+                    for node in response.source_nodes
+                ]
+        else:
+            retrieved_nodes, _ = self.retrieve_adaptively(
+                question,
+                profile,
+            )
+            retrieved_nodes = retrieved_nodes or []
+
+            generated_answer = self.synthesize_answer(
+                question,
+                retrieved_nodes,
+            )
+            retrieved_contexts = [
+                node_with_score.node.get_content()
+                for node_with_score in retrieved_nodes
+            ]
+
+        API_TRACKER.record_llm_operation(
+            "query_routing_and_answer",
+            llm_before,
+        )
+
+        unified_context = "\n---\n".join(
+            retrieved_contexts
+        )
 
         attempt = 0
         while attempt < max_retries:
             attempt += 1
 
-            is_faithful = self.evaluate_faithfulness(generated_answer, retrieved_contexts)
+            is_faithful = self.evaluate_faithfulness(
+                generated_answer,
+                retrieved_contexts,
+            )
 
             if is_faithful:
-                print(f"\n[ANSWER] (Verified Factual on Attempt {attempt})")
+                query_seconds = (
+                    time.perf_counter() - query_start
+                )
+                API_TRACKER.record_query(
+                    1,
+                    query_seconds,
+                    len(retrieved_contexts),
+                )
+                API_TRACKER.print_query_usage(
+                    llm_before
+                )
+
+                print(
+                    f"\n[ANSWER] "
+                    f"(Verified Factual on Attempt {attempt})"
+                )
                 print(generated_answer)
                 print("=" * 70)
                 return generated_answer
 
-            print(f"[AUDIT WARNING] Attempt {attempt} failed factuality check. Running self-correction...")
+            print(
+                f"[AUDIT WARNING] Attempt {attempt} "
+                f"failed factuality check. "
+                f"Running self-correction..."
+            )
 
             correction_prompt = f"""
-            You previously generated an ANSWER that contained fabrications, inferences, or assumptions 
-            not explicitly backed by the verified CONTEXT. You must completely rewrite the response.
+You previously generated an ANSWER that contained fabrications, inferences,
+or assumptions not explicitly backed by the verified CONTEXT.
+Rewrite the response completely.
 
-            CRITICAL RULES:
-            1. Rely ONLY on the clear facts explicitly stated in the CONTEXT below.
-            2. Do NOT extrapolate, assume, or pull outside knowledge from your pre-training data.
-            3. If the context does not explicitly contain the answer, say "The provided documentation does not contain this information."
+CRITICAL RULES:
+1. Rely ONLY on clear facts explicitly stated in CONTEXT.
+2. Do NOT extrapolate, assume, or use outside knowledge.
+3. If the context does not explicitly contain the answer, say:
+   "The provided documentation does not contain this information."
 
-            VERIFIED CONTEXT:
-            \"\"\"{unified_context}\"\"\"
+VERIFIED CONTEXT:
+\"\"\"{unified_context}\"\"\"
 
-            YOUR PREVIOUS HALUCINATED ANSWER (DO NOT REUSE THESE FALSE CLAIMS):
-            \"\"\"{generated_answer}\"\"\"
+YOUR PREVIOUS ANSWER:
+\"\"\"{generated_answer}\"\"\"
 
-            ORIGINAL USER QUESTION:
-            \"{question}\"
+ORIGINAL USER QUESTION:
+"{question}"
 
-            Provide your corrected, strictly factual answer below:
-            """
+Provide the corrected, strictly factual answer.
+"""
             try:
-                generated_answer = Settings.llm.complete(correction_prompt).text.strip()
-            except Exception as e:
-                print(f"--> [ERROR] Network drop during correction retry: {e}")
+                correction_before = (
+                    API_TRACKER.llm_snapshot()
+                )
+                generated_answer = (
+                    Settings.llm.complete(
+                        correction_prompt
+                    ).text.strip()
+                )
+                API_TRACKER.record_llm_operation(
+                    "self_correction",
+                    correction_before,
+                )
+            except Exception as error:
+                print(
+                    f"--> [ERROR] Network drop during "
+                    f"correction retry: {error}"
+                )
                 break
 
-        print("[GUARDRAIL BLOCK] Maximum self-correction retries reached. Output completely masked.")
-        return "I apologize, but I am unable to verify or prove that claim using the uploaded documentation."
+        query_seconds = (
+            time.perf_counter() - query_start
+        )
+        API_TRACKER.record_query(
+            1,
+            query_seconds,
+            len(retrieved_contexts),
+        )
+        API_TRACKER.print_query_usage(
+            llm_before
+        )
 
+        print(
+            "[GUARDRAIL BLOCK] Maximum self-correction "
+            "retries reached. Output completely masked."
+        )
+        return (
+            "I apologize, but I am unable to verify or prove "
+            "that claim using the uploaded documentation."
+        )
 
     def clear_storage(self):
 
@@ -2018,12 +2818,19 @@ if __name__ == "__main__":
             if not user_query:
                 continue
 
-            rag.ask(user_query)
+            rag_mode = input(
+                "RAG mode [auto/semantic/keyword/hybrid/summary] "
+                "(default auto): "
+            ).strip() or "auto"
+
+            rag.ask(
+                user_query,
+                rag_mode=rag_mode,
+            )
+            API_TRACKER.print_summary()
             
         except KeyboardInterrupt:
             print("\n\n--> [SYSTEM LOG] System execution interrupted by user. Closing safely.")
             break
         except Exception as e:
             print(f"\n[RUNTIME ERROR]: An error occurred: {e}\n")
-
- 
